@@ -222,16 +222,53 @@ def get_trades(username):
 
 
 # ============================================================
+# DISPLAY HELPERS
+# ============================================================
+
+def price_decimals(symbol):
+    if symbol in {"BTC-USD", "ETH-USD"}:
+        return 2
+    if symbol in {"EURUSD=X", "GBPUSD=X"}:
+        return 5
+    if symbol == "JPY=X":
+        return 3
+    if symbol == "GC=F":
+        return 2
+    # East African FX pairs are generally easier to read with 2 decimals.
+    if symbol in {"USDUGX=X", "USDKES=X", "USDTZS=X", "USDRWF=X", "USDETB=X"}:
+        return 2
+    return 4
+
+
+def fmt_price(value, symbol):
+    return f"{float(value):,.{price_decimals(symbol)}f}"
+
+
+def market_group(symbol):
+    if symbol in {"USDUGX=X", "USDKES=X", "USDTZS=X", "USDRWF=X", "USDETB=X"}:
+        return "East African FX"
+    return "Global Markets"
+
+
+# ============================================================
 # MARKET DATA
 # ============================================================
 
 ASSETS = {
+    # Major markets
     "Bitcoin": "BTC-USD",
     "Ethereum": "ETH-USD",
     "EUR/USD": "EURUSD=X",
     "GBP/USD": "GBPUSD=X",
     "USD/JPY": "JPY=X",
     "Gold": "GC=F",
+
+    # East African currencies
+    "USD/UGX 🇺🇬": "USDUGX=X",
+    "USD/KES 🇰🇪": "USDKES=X",
+    "USD/TZS 🇹🇿": "USDTZS=X",
+    "USD/RWF 🇷🇼": "USDRWF=X",
+    "USD/ETB 🇪🇹": "USDETB=X",
 }
 
 TIMEFRAMES = {
@@ -284,6 +321,11 @@ def demo_market(symbol, rows=250):
         "GBPUSD=X": 1.34,
         "JPY=X": 151,
         "GC=F": 4300,
+        "USDUGX=X": 3600,
+        "USDKES=X": 130,
+        "USDTZS=X": 2450,
+        "USDRWF=X": 1450,
+        "USDETB=X": 150,
     }.get(symbol, 100)
 
     returns = rng.normal(0, 0.008, rows)
@@ -606,8 +648,10 @@ with st.sidebar:
 
     st.divider()
 
-    asset_name = st.selectbox("Market", list(ASSETS.keys()))
+    asset_name = st.selectbox("Market", list(ASSETS.keys()), help="East African FX pairs are included alongside the original markets.")
     symbol = ASSETS[asset_name]
+    if market_group(symbol) == "East African FX":
+        st.caption("🌍 East African FX · indicative market data")
 
     st.session_state.timeframe = st.selectbox(
         "Timeframe",
@@ -630,6 +674,10 @@ with st.sidebar:
     )
 
     st.divider()
+    st.caption("East Africa")
+    st.caption("🇺🇬 UGX  ·  🇰🇪 KES  ·  🇹🇿 TZS")
+    st.caption("🇷🇼 RWF  ·  🇪🇹 ETB")
+
     if st.button("Sign out", use_container_width=True):
         st.session_state.clear()
         st.rerun()
@@ -692,6 +740,12 @@ if page == "Dashboard":
     c4.metric("Win rate", f"{win_rate:.1f}%")
 
     st.subheader(f"{asset_name} · {st.session_state.timeframe}")
+
+    if market_group(symbol) == "East African FX":
+        st.caption(
+            "East African currencies are shown as local currency units per 1 USD. "
+            "Quotes may be delayed and availability depends on the data provider."
+        )
 
     fig = go.Figure()
     fig.add_trace(
@@ -771,7 +825,7 @@ elif page == "Trade":
     st.caption("Orders are simulated. Risk is calculated from the selected stop distance.")
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("Current price", f"{last_price:,.5f}")
+    c1.metric("Current price", fmt_price(last_price, symbol))
     c2.metric("Signal", signal["signal"])
     c3.metric("Risk", f"{st.session_state.risk:.2f}%")
 
@@ -790,7 +844,7 @@ elif page == "Trade":
         )
 
         st.write(
-            f"Entry **{entry:,.5f}** · Current **{last_price:,.5f}** · "
+            f"Entry **{fmt_price(entry, symbol)}** · Current **{fmt_price(last_price, symbol)}** · "
             f"Qty **{qty:.6f}**"
         )
         st.metric("Unrealized P/L", f"${pnl:,.2f}")
@@ -821,9 +875,9 @@ elif page == "Trade":
             reward_money = abs(target - last_price) * qty
 
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Entry", f"{last_price:,.5f}")
-            c2.metric("Stop loss", f"{stop:,.5f}")
-            c3.metric("Take profit", f"{target:,.5f}")
+            c1.metric("Entry", fmt_price(last_price, symbol))
+            c2.metric("Stop loss", fmt_price(stop, symbol))
+            c3.metric("Take profit", fmt_price(target, symbol))
             c4.metric("R:R", "1 : 2")
 
             st.write(
@@ -927,5 +981,5 @@ elif page == "History":
 st.divider()
 st.caption(
     "SAIM · Simple realistic paper trading · "
-    "No real broker orders are placed · Market data can be delayed"
+    "East African FX included · No real broker orders are placed · Market data can be delayed"
 )
