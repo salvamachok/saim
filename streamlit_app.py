@@ -942,9 +942,17 @@ elif page == "History":
         c4.metric("Win rate", f"{win_rate:.1f}%")
 
         show = trades.copy()
-        show["pnl"] = show["pnl"].round(2)
-        show["entry"] = show["entry"].round(5)
-        show["exit"] = show["exit"].round(5)
+
+        # SQLite returns NULL for the exit price of OPEN trades.
+        # Convert numeric columns explicitly before rounding so pandas
+        # does not try to round an object/None value.
+        for col, decimals in {
+            "pnl": 2,
+            "entry": 5,
+            "exit": 5,
+        }.items():
+            if col in show.columns:
+                show[col] = pd.to_numeric(show[col], errors="coerce").round(decimals)
 
         st.dataframe(show, hide_index=True, use_container_width=True)
 
