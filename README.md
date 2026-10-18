@@ -1,0 +1,2 @@
+# saim
+Trading Bot
