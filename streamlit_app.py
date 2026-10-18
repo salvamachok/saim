@@ -235,7 +235,7 @@ def price_decimals(symbol):
     if symbol == "GC=F":
         return 2
     # East African FX pairs are generally easier to read with 2 decimals.
-    if symbol in {"USDUGX=X", "USDKES=X", "USDTZS=X", "USDRWF=X", "USDETB=X"}:
+    if symbol in {"USDUGX=X", "USDKES=X", "USDTZS=X", "USDRWF=X", "USDETB=X", "USDSSP=X"}:
         return 2
     return 4
 
@@ -245,7 +245,7 @@ def fmt_price(value, symbol):
 
 
 def market_group(symbol):
-    if symbol in {"USDUGX=X", "USDKES=X", "USDTZS=X", "USDRWF=X", "USDETB=X"}:
+    if symbol in {"USDUGX=X", "USDKES=X", "USDTZS=X", "USDRWF=X", "USDETB=X", "USDSSP=X"}:
         return "East African FX"
     return "Global Markets"
 
@@ -269,6 +269,7 @@ ASSETS = {
     "USD/TZS 🇹🇿": "USDTZS=X",
     "USD/RWF 🇷🇼": "USDRWF=X",
     "USD/ETB 🇪🇹": "USDETB=X",
+    "USD/SSP 🇸🇸": "USDSSP=X",
 }
 
 TIMEFRAMES = {
@@ -326,6 +327,7 @@ def demo_market(symbol, rows=250):
         "USDTZS=X": 2450,
         "USDRWF=X": 1450,
         "USDETB=X": 150,
+        "USDSSP=X": 550,
     }.get(symbol, 100)
 
     returns = rng.normal(0, 0.008, rows)
@@ -676,7 +678,7 @@ with st.sidebar:
     st.divider()
     st.caption("East Africa")
     st.caption("🇺🇬 UGX  ·  🇰🇪 KES  ·  🇹🇿 TZS")
-    st.caption("🇷🇼 RWF  ·  🇪🇹 ETB")
+    st.caption("🇷🇼 RWF  ·  🇪🇹 ETB  ·  🇸🇸 SSP")
 
     if st.button("Sign out", use_container_width=True):
         st.session_state.clear()
