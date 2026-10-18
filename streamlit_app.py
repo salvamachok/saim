@@ -14,7 +14,7 @@ import sqlite3
 from datetime import datetime
 from contextlib import contextmanager
 
-import plotly.graph_objects as go
+
 
 st.set_page_config(page_title="SAI Trading", page_icon="📈", layout="wide")
 
