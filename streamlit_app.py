@@ -2,12 +2,13 @@
 import os
 import sqlite3
 import hashlib
-from contextlib import contextmanager
 from datetime import datetime, timezone
+from contextlib import contextmanager
 
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
+from streamlit_autorefresh import st_autorefresh
 
 try:
     import yfinance as yf
@@ -16,10 +17,7 @@ except ImportError:
 
 
 # ============================================================
-# SAIM - SIMPLE REALISTIC PAPER TRADING APP
-# ============================================================
-# Live market data when yfinance is available.
-# All orders remain PAPER TRADES. No broker orders are sent.
+# CONFIGURATION
 # ============================================================
 
 st.set_page_config(
@@ -32,36 +30,59 @@ st.set_page_config(
 DB_PATH = os.environ.get("DB_PATH", "saim.db")
 STARTING_BALANCE = 10_000.0
 COMMISSION = 0.001
-DEFAULT_RISK = 1.0
+REFRESH_MS = 30_000
+
+ASSETS = {
+    "Bitcoin": "BTC-USD",
+    "Ethereum": "ETH-USD",
+    "EUR/USD": "EURUSD=X",
+    "GBP/USD": "GBPUSD=X",
+    "USD/JPY": "JPY=X",
+    "Gold": "GC=F",
+    "USD/UGX": "USDUGX=X",
+    "USD/KES": "USDKES=X",
+    "USD/TZS": "USDTZS=X",
+    "USD/RWF": "USDRWF=X",
+    "USD/ETB": "USDETB=X",
+    "USD/SSP": "USDSSP=X",
+}
+
+TIMEFRAMES = {
+    "1 hour": ("60d", "1h"),
+    "4 hours": ("180d", "1h"),
+    "1 day": ("2y", "1d"),
+}
+
+EAST_AFRICAN = {
+    "USDUGX=X", "USDKES=X", "USDTZS=X",
+    "USDRWF=X", "USDETB=X", "USDSSP=X",
+}
 
 
-# -----------------------------
-# Simple styling
-# -----------------------------
+# ============================================================
+# STYLE
+# ============================================================
+
 st.markdown(
     """
     <style>
     .stApp { background: #0b1020; }
     [data-testid="stSidebar"] { background: #10172a; }
-    .block-container { max-width: 1400px; padding-top: 1.5rem; }
+    .block-container {
+        max-width: 1400px;
+        padding-top: 1.5rem;
+    }
     .saim-title {
         font-size: 2.4rem;
         font-weight: 800;
         letter-spacing: -1px;
     }
     .muted { color: #94a3b8; }
-    .card {
-        background: #131d32;
-        border: 1px solid #283650;
-        border-radius: 14px;
-        padding: 16px;
-        margin-bottom: 12px;
-    }
     .paper {
         background: #172235;
         border: 1px solid #355070;
         border-radius: 10px;
-        padding: 10px 14px;
+        padding: 12px 16px;
         margin: 8px 0 18px 0;
     }
     </style>
@@ -84,8 +105,12 @@ def db():
         conn.close()
 
 
-def password_hash(password: str) -> str:
-    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+def password_hash(password):
+    # Kept compatible with the existing SAIM database.
+    # For a production service, use Argon2 or scrypt.
+    return hashlib.sha256(
+        password.encode("utf-8")
+    ).hexdigest()
 
 
 def init_db():
@@ -115,7 +140,7 @@ def init_db():
                 stop_loss REAL NOT NULL,
                 take_profit REAL NOT NULL,
                 opened_at TEXT NOT NULL,
-                PRIMARY KEY(username, symbol)
+                PRIMARY KEY (username, symbol)
             )
         """)
 
@@ -133,45 +158,30 @@ def init_db():
                 status TEXT NOT NULL
             )
         """)
-
-        count = conn.execute(
-            "SELECT COUNT(*) FROM users"
-        ).fetchone()[0]
-
-        if count == 0:
-            conn.execute(
-                "INSERT INTO users(username,password,role) VALUES(?,?,?)",
-                ("admin", password_hash("admin123"), "admin"),
-            )
-            conn.execute(
-                "INSERT INTO balance(username,amount) VALUES(?,?)",
-                ("admin", STARTING_BALANCE),
-            )
-
-        users = conn.execute(
-            "SELECT username FROM users"
-        ).fetchall()
-
-        for row in users:
-            conn.execute(
-                "INSERT OR IGNORE INTO balance(username,amount) VALUES(?,?)",
-                (row["username"], STARTING_BALANCE),
-            )
-
         conn.commit()
 
 
 init_db()
 
 
+# ============================================================
+# ACCOUNTS
+# ============================================================
+
 def authenticate(username, password):
     with db() as conn:
         row = conn.execute(
-            "SELECT role FROM users WHERE username=? AND password=?",
+            """
+            SELECT role FROM users
+            WHERE username = ? AND password = ?
+            """,
             (username.strip(), password_hash(password)),
         ).fetchone()
 
-    return (True, row["role"]) if row else (False, None)
+    if row:
+        return True, row["role"]
+
+    return False, None
 
 
 def register(username, password):
@@ -186,16 +196,23 @@ def register(username, password):
     try:
         with db() as conn:
             conn.execute(
-                "INSERT INTO users(username,password,role) VALUES(?,?,?)",
-                (username, password_hash(password), "user"),
+                """
+                INSERT INTO users (username, password, role)
+                VALUES (?, ?, 'user')
+                """,
+                (username, password_hash(password)),
             )
+
             conn.execute(
-                "INSERT INTO balance(username,amount) VALUES(?,?)",
+                """
+                INSERT INTO balance (username, amount)
+                VALUES (?, ?)
+                """,
                 (username, STARTING_BALANCE),
             )
             conn.commit()
 
-        return True, "Account created."
+        return True, "Account created. You can now sign in."
 
     except sqlite3.IntegrityError:
         return False, "That username already exists."
@@ -204,7 +221,7 @@ def register(username, password):
 def get_balance(username):
     with db() as conn:
         row = conn.execute(
-            "SELECT amount FROM balance WHERE username=?",
+            "SELECT amount FROM balance WHERE username = ?",
             (username,),
         ).fetchone()
 
@@ -214,7 +231,10 @@ def get_balance(username):
 def get_position(username, symbol):
     with db() as conn:
         return conn.execute(
-            "SELECT * FROM positions WHERE username=? AND symbol=?",
+            """
+            SELECT * FROM positions
+            WHERE username = ? AND symbol = ?
+            """,
             (username, symbol),
         ).fetchone()
 
@@ -224,7 +244,7 @@ def get_positions(username):
         return pd.read_sql_query(
             """
             SELECT * FROM positions
-            WHERE username=?
+            WHERE username = ?
             ORDER BY opened_at DESC
             """,
             conn,
@@ -236,9 +256,10 @@ def get_trades(username):
     with db() as conn:
         return pd.read_sql_query(
             """
-            SELECT id,time,symbol,side,qty,entry,exit,pnl,status
+            SELECT id, time, symbol, side, qty, entry,
+                   exit, pnl, status
             FROM paper_trades
-            WHERE username=?
+            WHERE username = ?
             ORDER BY id DESC
             """,
             conn,
@@ -247,73 +268,13 @@ def get_trades(username):
 
 
 # ============================================================
-# DISPLAY HELPERS
-# ============================================================
-
-def price_decimals(symbol):
-    if symbol in {"BTC-USD", "ETH-USD"}:
-        return 2
-
-    if symbol in {"EURUSD=X", "GBPUSD=X"}:
-        return 5
-
-    if symbol == "JPY=X":
-        return 3
-
-    if symbol == "GC=F":
-        return 2
-
-    if symbol in {
-        "USDUGX=X", "USDKES=X", "USDTZS=X",
-        "USDRWF=X", "USDETB=X", "USDSSP=X"
-    }:
-        return 2
-
-    return 4
-
-
-def fmt_price(value, symbol):
-    return f"{float(value):,.{price_decimals(symbol)}f}"
-
-
-def market_group(symbol):
-    if symbol in {
-        "USDUGX=X", "USDKES=X", "USDTZS=X",
-        "USDRWF=X", "USDETB=X", "USDSSP=X"
-    }:
-        return "East African FX"
-
-    return "Global Markets"
-
-
-# ============================================================
 # MARKET DATA
 # ============================================================
 
-ASSETS = {
-    "Bitcoin": "BTC-USD",
-    "Ethereum": "ETH-USD",
-    "EUR/USD": "EURUSD=X",
-    "GBP/USD": "GBPUSD=X",
-    "USD/JPY": "JPY=X",
-    "Gold": "GC=F",
-    "USD/UGX": "USDUGX=X",
-    "USD/KES": "USDKES=X",
-    "USD/TZS": "USDTZS=X",
-    "USD/RWF": "USDRWF=X",
-    "USD/ETB": "USDETB=X",
-    "USD/SSP": "USDSSP=X",
-}
+@st.cache_data(ttl=30, show_spinner=False)
+def load_market(symbol, period, interval):
+    """Fetch provider data. An empty DataFrame means unavailable."""
 
-TIMEFRAMES = {
-    "1 hour": ("60d", "1h"),
-    "4 hours": ("180d", "1h"),
-    "1 day": ("2y", "1d"),
-}
-
-
-@st.cache_data(ttl=60)
-def load_market(symbol, period="60d", interval="1h"):
     if yf is None:
         return pd.DataFrame()
 
@@ -324,6 +285,7 @@ def load_market(symbol, period="60d", interval="1h"):
             interval=interval,
             progress=False,
             auto_adjust=False,
+            threads=False,
         )
 
         if data.empty:
@@ -334,29 +296,28 @@ def load_market(symbol, period="60d", interval="1h"):
 
         needed = ["Open", "High", "Low", "Close", "Volume"]
 
-        for col in needed:
-            if col not in data.columns:
-                data[col] = 0.0
+        for column in needed:
+            if column not in data.columns:
+                data[column] = 0.0
 
-        data = data[needed].dropna(
+        return data[needed].dropna(
             subset=["Open", "High", "Low", "Close"]
         ).copy()
-
-        data.index = pd.to_datetime(data.index)
-
-        return data
 
     except Exception:
         return pd.DataFrame()
 
 
 def demo_market(symbol, rows=250):
-    """Fallback demonstration data when market data is unavailable."""
+    """
+    Simulated fallback data.
+    This must never be presented as a live market quote.
+    """
     import numpy as np
 
     rng = np.random.default_rng(abs(hash(symbol)) % (2**32))
 
-    start = {
+    starting_prices = {
         "BTC-USD": 65000,
         "ETH-USD": 2500,
         "EURUSD=X": 1.17,
@@ -369,30 +330,31 @@ def demo_market(symbol, rows=250):
         "USDRWF=X": 1450,
         "USDETB=X": 150,
         "USDSSP=X": 550,
-    }.get(symbol, 100)
+    }
+
+    start = starting_prices.get(symbol, 100)
 
     returns = rng.normal(0, 0.008, rows)
     close = start * np.exp(returns.cumsum())
     high = close * (1 + rng.uniform(0.0005, 0.012, rows))
     low = close * (1 - rng.uniform(0.0005, 0.012, rows))
-    open_ = (high + low) / 2
-    volume = rng.integers(1000, 100000, rows)
+    open_price = (high + low) / 2
 
-    idx = pd.date_range(
-        end=pd.Timestamp.utcnow(),
+    index = pd.date_range(
+        end=pd.Timestamp.now(tz="UTC"),
         periods=rows,
         freq="h",
     )
 
     return pd.DataFrame(
         {
-            "Open": open_,
+            "Open": open_price,
             "High": high,
             "Low": low,
             "Close": close,
-            "Volume": volume,
+            "Volume": rng.integers(1000, 100000, rows),
         },
-        index=idx,
+        index=index,
     )
 
 
@@ -401,8 +363,10 @@ def get_data(symbol, timeframe):
     data = load_market(symbol, period, interval)
 
     if data.empty:
+        st.session_state["market_data_mode"] = "DEMO DATA"
         return demo_market(symbol)
 
+    st.session_state["market_data_mode"] = "PROVIDER DATA"
     return data
 
 
@@ -410,86 +374,83 @@ def get_data(symbol, timeframe):
 # INDICATORS AND SIGNALS
 # ============================================================
 
-def add_indicators(df):
-    d = df.copy()
+def add_indicators(data):
+    result = data.copy()
 
-    d["EMA20"] = d["Close"].ewm(
+    result["EMA20"] = result["Close"].ewm(
         span=20, adjust=False
     ).mean()
 
-    d["EMA50"] = d["Close"].ewm(
+    result["EMA50"] = result["Close"].ewm(
         span=50, adjust=False
     ).mean()
 
-    delta = d["Close"].diff()
+    delta = result["Close"].diff()
     gain = delta.clip(lower=0).rolling(14).mean()
     loss = (-delta.clip(upper=0)).rolling(14).mean()
-    rs = gain / loss.replace(0, float("nan"))
-    d["RSI"] = 100 - (100 / (1 + rs))
 
-    tr = pd.concat(
+    rs = gain / loss.replace(0, float("nan"))
+    result["RSI"] = 100 - (100 / (1 + rs))
+
+    true_range = pd.concat(
         [
-            d["High"] - d["Low"],
-            (d["High"] - d["Close"].shift()).abs(),
-            (d["Low"] - d["Close"].shift()).abs(),
+            result["High"] - result["Low"],
+            (result["High"] - result["Close"].shift()).abs(),
+            (result["Low"] - result["Close"].shift()).abs(),
         ],
         axis=1,
     ).max(axis=1)
 
-    d["ATR"] = tr.rolling(14).mean()
+    result["ATR"] = true_range.rolling(14).mean()
 
-    return d
+    return result
 
 
-def make_signal(df):
-    d = add_indicators(df).dropna().copy()
+def make_signal(data):
+    clean = add_indicators(data).dropna()
+    price = float(data["Close"].iloc[-1])
 
-    if len(d) < 60:
+    if len(clean) < 60:
         return {
             "signal": "WAIT",
             "score": 0,
             "confidence": 50,
             "rsi": 50,
             "atr": 0,
-            "price": float(df["Close"].iloc[-1]),
-            "ema20": float(df["Close"].iloc[-1]),
-            "ema50": float(df["Close"].iloc[-1]),
+            "price": price,
+            "ema20": price,
+            "ema50": price,
         }
 
-    last = d.iloc[-1]
+    last = clean.iloc[-1]
     score = 0
 
-    # Trend
     if last["EMA20"] > last["EMA50"]:
         score += 2
     elif last["EMA20"] < last["EMA50"]:
         score -= 2
 
-    # Momentum
     if last["RSI"] > 55:
         score += 1
     elif last["RSI"] < 45:
         score -= 1
 
-    # Recent price direction
-    if last["Close"] > d["Close"].iloc[-4]:
+    if last["Close"] > clean["Close"].iloc[-4]:
         score += 1
-    elif last["Close"] < d["Close"].iloc[-4]:
+    elif last["Close"] < clean["Close"].iloc[-4]:
         score -= 1
 
     if score >= 3:
-        signal_name = "BUY"
+        signal = "BUY"
     elif score <= -3:
-        signal_name = "SELL"
+        signal = "SELL"
     else:
-        signal_name = "WAIT"
-
-    confidence = min(95, 50 + abs(score) * 10)
+        signal = "WAIT"
 
     return {
-        "signal": signal_name,
+        "signal": signal,
         "score": score,
-        "confidence": confidence,
+        "confidence": min(95, 50 + abs(score) * 10),
         "rsi": float(last["RSI"]),
         "atr": float(last["ATR"]),
         "price": float(last["Close"]),
@@ -498,134 +459,131 @@ def make_signal(df):
     }
 
 
+def price_decimals(symbol):
+    if symbol in {"BTC-USD", "ETH-USD", "GC=F"}:
+        return 2
+    if symbol in {"EURUSD=X", "GBPUSD=X"}:
+        return 5
+    if symbol == "JPY=X":
+        return 3
+    if symbol in EAST_AFRICAN:
+        return 2
+    return 4
+
+
+def fmt_price(value, symbol):
+    return f"{float(value):,.{price_decimals(symbol)}f}"
+
+
 # ============================================================
 # PAPER TRADING
 # ============================================================
 
 def position_levels(price, atr, side):
-    # 1.5 ATR stop and 3 ATR target: approximately 1:2 R:R.
     if side == "BUY":
-        sl = price - 1.5 * atr
-        tp = price + 3.0 * atr
+        stop = max(price - 1.5 * atr, 0.000001)
+        target = max(price + 3 * atr, 0.000001)
     else:
-        sl = price + 1.5 * atr
-        tp = price - 3.0 * atr
+        stop = max(price + 1.5 * atr, 0.000001)
+        target = max(price - 3 * atr, 0.000001)
 
-    return max(sl, 0.000001), max(tp, 0.000001)
+    return stop, target
 
 
 def calculate_qty(balance, price, stop, risk_pct):
-    risk_money = balance * (risk_pct / 100)
+    risk_money = balance * risk_pct / 100
     distance = abs(price - stop)
 
     if distance <= 0 or price <= 0:
         return 0.0
 
-    qty = risk_money / distance
-
-    # Limit position notional to 25% of account balance.
-    max_notional = balance * 0.25
-    qty = min(qty, max_notional / price)
-
-    return max(qty, 0.0)
+    return max(
+        min(risk_money / distance, balance * 0.25 / price),
+        0.0,
+    )
 
 
 def open_position(username, symbol, side, price, stop, target, qty):
-    balance = get_balance(username)
-    notional = qty * price
-    fee = notional * COMMISSION
+    if get_position(username, symbol):
+        return False, "A position is already open for this market."
 
-    if fee >= balance:
-        return False, "Not enough balance for fees."
+    balance = get_balance(username)
+    fee = qty * price * COMMISSION
+
+    if qty <= 0 or fee >= balance:
+        return False, "Insufficient paper balance for this order."
+
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     with db() as conn:
         conn.execute(
             """
             INSERT INTO positions
-            (username,symbol,side,qty,entry,stop_loss,take_profit,opened_at)
-            VALUES(?,?,?,?,?,?,?,?)
+            (username, symbol, side, qty, entry,
+             stop_loss, take_profit, opened_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                username,
-                symbol,
-                side,
-                qty,
-                price,
-                stop,
-                target,
-                datetime.now(timezone.utc).isoformat(
-                    timespec="seconds"
-                ),
+                username, symbol, side, qty, price,
+                stop, target, now,
             ),
         )
 
         conn.execute(
-            "UPDATE balance SET amount=? WHERE username=?",
-            (balance - fee, username),
+            "UPDATE balance SET amount = amount - ? WHERE username = ?",
+            (fee, username),
         )
 
         conn.execute(
             """
             INSERT INTO paper_trades
-            (username,time,symbol,side,qty,entry,exit,pnl,status)
-            VALUES(?,?,?,?,?,?,?,?,?)
+            (username, time, symbol, side, qty,
+             entry, exit, pnl, status)
+            VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 'OPEN')
             """,
-            (
-                username,
-                datetime.now(timezone.utc).isoformat(
-                    timespec="seconds"
-                ),
-                symbol,
-                side,
-                qty,
-                price,
-                None,
-                -fee,
-                "OPEN",
-            ),
+            (username, now, symbol, side, qty, price, -fee),
         )
 
         conn.commit()
 
-    return True, f"Paper {side} opened."
+    return True, f"Paper {side} position opened."
 
 
 def close_position(username, symbol, price):
-    pos = get_position(username, symbol)
+    position = get_position(username, symbol)
 
-    if not pos:
+    if not position:
         return False, "No open position."
 
-    entry = float(pos["entry"])
-    qty = float(pos["qty"])
-    side = pos["side"]
+    entry = float(position["entry"])
+    qty = float(position["qty"])
+    side = position["side"]
 
-    gross = (
-        (price - entry) * qty
-        if side == "BUY"
-        else (entry - price) * qty
-    )
+    if side == "BUY":
+        gross_pnl = (price - entry) * qty
+    else:
+        gross_pnl = (entry - price) * qty
 
     exit_fee = price * qty * COMMISSION
-    pnl = gross - exit_fee
+    pnl = gross_pnl - exit_fee
 
     with db() as conn:
         conn.execute(
-            "UPDATE balance SET amount=amount+? WHERE username=?",
+            "UPDATE balance SET amount = amount + ? WHERE username = ?",
             (pnl, username),
         )
 
         conn.execute(
             """
             UPDATE paper_trades
-            SET exit=?, pnl=?, status='CLOSED'
-            WHERE username=? AND symbol=? AND status='OPEN'
+            SET exit = ?, pnl = pnl + ?, status = 'CLOSED'
+            WHERE username = ? AND symbol = ? AND status = 'OPEN'
             """,
             (price, pnl, username, symbol),
         )
 
         conn.execute(
-            "DELETE FROM positions WHERE username=? AND symbol=?",
+            "DELETE FROM positions WHERE username = ? AND symbol = ?",
             (username, symbol),
         )
 
@@ -635,45 +593,46 @@ def close_position(username, symbol, price):
 
 
 def check_stops(username, symbol, price):
-    pos = get_position(username, symbol)
+    position = get_position(username, symbol)
 
-    if not pos:
+    if not position:
         return None
 
-    side = pos["side"]
-    sl = float(pos["stop_loss"])
-    tp = float(pos["take_profit"])
+    side = position["side"]
+    stop = float(position["stop_loss"])
+    target = float(position["take_profit"])
 
-    hit = (
-        price <= sl or price >= tp
-        if side == "BUY"
-        else price >= sl or price <= tp
-    )
+    if side == "BUY":
+        hit = price <= stop or price >= target
+    else:
+        hit = price >= stop or price <= target
 
     if hit:
         close_position(username, symbol, price)
-        return "Position automatically closed at stop/target."
+        return "Paper position closed at stop-loss or take-profit."
 
     return None
 
 
 # ============================================================
-# SESSION
+# SESSION STATE
 # ============================================================
 
-for key, value in {
+defaults = {
     "logged": False,
     "username": "",
     "role": "",
     "timeframe": "1 hour",
-    "risk": DEFAULT_RISK,
-}.items():
+    "risk": 1.0,
+}
+
+for key, value in defaults.items():
     if key not in st.session_state:
         st.session_state[key] = value
 
 
 # ============================================================
-# LOGIN AND ACCOUNT CREATION
+# SIGN-IN
 # ============================================================
 
 if not st.session_state.logged:
@@ -682,63 +641,71 @@ if not st.session_state.logged:
     with center:
         st.markdown(
             '<div class="saim-title">SAIM</div>'
-            '<div class="muted">Simple paper trading intelligence</div>',
+            '<div class="muted">Paper Trading Intelligence</div>',
             unsafe_allow_html=True,
         )
 
-        st.write("")
-        tab1, tab2 = st.tabs(["Sign in", "Create account"])
+        login_tab, register_tab = st.tabs(
+            ["Sign in", "Create account"]
+        )
 
-        with tab1:
-            with st.form("login"):
-                u = st.text_input("Username")
-                p = st.text_input("Password", type="password")
-
-                login_button = st.form_submit_button(
+        with login_tab:
+            with st.form("login_form"):
+                login_username = st.text_input("Username")
+                login_password = st.text_input(
+                    "Password", type="password"
+                )
+                login_submit = st.form_submit_button(
                     "Sign in",
                     type="primary",
                     use_container_width=True,
                 )
 
-            if login_button:
-                ok, role = authenticate(u, p)
+            if login_submit:
+                ok, role = authenticate(
+                    login_username, login_password
+                )
 
                 if ok:
                     st.session_state.logged = True
-                    st.session_state.username = u.strip()
+                    st.session_state.username = login_username.strip()
                     st.session_state.role = role
                     st.rerun()
                 else:
                     st.error("Incorrect username or password.")
 
-        with tab2:
-            with st.form("register"):
-                u = st.text_input("Username", key="new_u")
-                p = st.text_input(
-                    "Password",
-                    type="password",
-                    key="new_p",
+        with register_tab:
+            with st.form("register_form"):
+                new_username = st.text_input(
+                    "Username", key="new_username"
                 )
-                cp = st.text_input(
-                    "Confirm password",
+                new_password = st.text_input(
+                    "Password (minimum 8 characters)",
                     type="password",
+                    key="new_password",
                 )
-
-                create_button = st.form_submit_button(
+                confirm_password = st.text_input(
+                    "Confirm password", type="password"
+                )
+                register_submit = st.form_submit_button(
                     "Create account",
                     use_container_width=True,
                 )
 
-            if create_button:
-                if p != cp:
+            if register_submit:
+                if new_password != confirm_password:
                     st.error("Passwords do not match.")
                 else:
-                    ok, message = register(u, p)
-                    (st.success if ok else st.error)(message)
+                    ok, message = register(
+                        new_username, new_password
+                    )
+                    if ok:
+                        st.success(message)
+                    else:
+                        st.error(message)
 
         st.caption(
-            "Paper trading only. Market data may be delayed. "
-            "No real orders are sent."
+            "Paper trading only. No real broker orders are sent."
         )
 
     st.stop()
@@ -755,20 +722,14 @@ with st.sidebar:
         '<div class="saim-title">SAIM</div>',
         unsafe_allow_html=True,
     )
-
     st.caption(f"Account: {username}")
     st.divider()
 
-    asset_name = st.selectbox(
-        "Market",
-        list(ASSETS.keys()),
-        help="East African FX pairs are included alongside global markets.",
-    )
-
+    asset_name = st.selectbox("Market", list(ASSETS.keys()))
     symbol = ASSETS[asset_name]
 
-    if market_group(symbol) == "East African FX":
-        st.caption("East African FX · indicative market data")
+    if symbol in EAST_AFRICAN:
+        st.caption("East African FX · indicative data")
 
     st.session_state.timeframe = st.selectbox(
         "Timeframe",
@@ -780,9 +741,9 @@ with st.sidebar:
 
     st.session_state.risk = st.slider(
         "Risk per trade (%)",
-        0.25,
-        2.0,
-        float(st.session_state.risk),
+        min_value=0.25,
+        max_value=2.0,
+        value=float(st.session_state.risk),
         step=0.25,
     )
 
@@ -793,9 +754,7 @@ with st.sidebar:
     )
 
     st.divider()
-    st.caption("East Africa")
-    st.caption("UGX · KES · TZS")
-    st.caption("RWF · ETB · SSP")
+    st.caption("UGX · KES · TZS · RWF · ETB · SSP")
 
     if st.button("Sign out", use_container_width=True):
         st.session_state.clear()
@@ -803,11 +762,19 @@ with st.sidebar:
 
 
 # ============================================================
-# LOAD DATA
+# AUTO-REFRESH AND CURRENT MARKET
 # ============================================================
 
-data = get_data(symbol, st.session_state.timeframe)
-data = add_indicators(data)
+# Requires streamlit-autorefresh in requirements.txt.
+st_autorefresh(
+    interval=REFRESH_MS,
+    limit=None,
+    key="saim_live_refresh",
+)
+
+data = add_indicators(
+    get_data(symbol, st.session_state.timeframe)
+)
 
 last_price = float(data["Close"].iloc[-1])
 signal = make_signal(data)
@@ -817,6 +784,17 @@ stop_message = check_stops(username, symbol, last_price)
 
 if stop_message:
     st.toast(stop_message)
+
+if st.session_state.get("market_data_mode") == "DEMO DATA":
+    st.warning(
+        "DEMO DATA ONLY — the provider returned no quotes. "
+        "Prices displayed are simulated, not live."
+    )
+else:
+    st.caption(
+        "Market data: provider feed. The dashboard refreshes every "
+        "30 seconds while open. Provider quotes may be delayed."
+    )
 
 
 # ============================================================
@@ -831,73 +809,62 @@ if page == "Dashboard":
 
     st.markdown(
         '<div class="paper"><strong>PAPER MODE</strong> — '
-        'This app simulates trades using market prices. '
-        'It never sends money to a broker.</div>',
+        'all trades are simulated. No real money is used.</div>',
         unsafe_allow_html=True,
     )
 
-    positions = get_positions(username)
-    open_pos = get_position(username, symbol)
+    open_position_row = get_position(username, symbol)
+    trades = get_trades(username)
 
     unrealized = 0.0
 
-    if open_pos:
-        entry = float(open_pos["entry"])
-        qty = float(open_pos["qty"])
-        side = open_pos["side"]
+    if open_position_row:
+        entry = float(open_position_row["entry"])
+        qty = float(open_position_row["qty"])
+        side = open_position_row["side"]
 
-        unrealized = (
-            (last_price - entry) * qty
-            if side == "BUY"
-            else (entry - last_price) * qty
-        )
-
-    trades = get_trades(username)
+        if side == "BUY":
+            unrealized = (last_price - entry) * qty
+        else:
+            unrealized = (entry - last_price) * qty
 
     closed = (
         trades[trades["status"] == "CLOSED"]
-        if not trades.empty
-        else trades
+        if not trades.empty else trades
     )
 
-    total_realized = (
+    realized = (
         float(closed["pnl"].sum())
-        if not closed.empty
-        else 0.0
+        if not closed.empty else 0.0
     )
 
     wins = (
         int((closed["pnl"] > 0).sum())
-        if not closed.empty
-        else 0
+        if not closed.empty else 0
     )
 
     win_rate = (
         wins / len(closed) * 100
-        if len(closed)
-        else 0
+        if len(closed) else 0
     )
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Cash balance", f"${balance:,.2f}")
     c2.metric("Unrealized P/L", f"${unrealized:,.2f}")
-    c3.metric("Realized P/L", f"${total_realized:,.2f}")
+    c3.metric("Realized P/L", f"${realized:,.2f}")
     c4.metric("Win rate", f"{win_rate:.1f}%")
 
-    st.subheader(
-        f"{asset_name} · {st.session_state.timeframe}"
-    )
+    st.subheader(f"{asset_name} · {st.session_state.timeframe}")
 
-    if market_group(symbol) == "East African FX":
+    if symbol in EAST_AFRICAN:
         st.caption(
-            "East African currencies are shown as local currency "
-            "units per 1 USD. Quotes may be delayed and availability "
-            "depends on the data provider."
+            "Indicative local currency units per USD. "
+            "Provider availability varies by currency."
         )
 
-    fig = go.Figure()
+    chart = go.Figure()
 
-    fig.add_trace(
+    chart.add_trace(
         go.Candlestick(
             x=data.index,
             open=data["Open"],
@@ -908,7 +875,7 @@ if page == "Dashboard":
         )
     )
 
-    fig.add_trace(
+    chart.add_trace(
         go.Scatter(
             x=data.index,
             y=data["EMA20"],
@@ -916,7 +883,7 @@ if page == "Dashboard":
         )
     )
 
-    fig.add_trace(
+    chart.add_trace(
         go.Scatter(
             x=data.index,
             y=data["EMA50"],
@@ -924,33 +891,33 @@ if page == "Dashboard":
         )
     )
 
-    if open_pos:
-        fig.add_hline(
-            y=float(open_pos["entry"]),
+    if open_position_row:
+        chart.add_hline(
+            y=float(open_position_row["entry"]),
             annotation_text="Entry",
         )
-        fig.add_hline(
-            y=float(open_pos["stop_loss"]),
+        chart.add_hline(
+            y=float(open_position_row["stop_loss"]),
             annotation_text="Stop",
         )
-        fig.add_hline(
-            y=float(open_pos["take_profit"]),
+        chart.add_hline(
+            y=float(open_position_row["take_profit"]),
             annotation_text="Target",
         )
 
-    fig.update_layout(
+    chart.update_layout(
         template="plotly_dark",
         height=520,
         xaxis_rangeslider_visible=False,
         margin=dict(l=10, r=10, t=20, b=10),
     )
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(chart, use_container_width=True)
 
     left, right = st.columns([1, 1.3])
 
     with left:
-        st.subheader("SAIM signal")
+        st.subheader("SAIM Signal")
 
         if signal["signal"] == "BUY":
             st.success("BUY")
@@ -959,45 +926,38 @@ if page == "Dashboard":
         else:
             st.info("WAIT")
 
-        st.metric(
-            "Confidence",
-            f'{signal["confidence"]:.0f}%',
-        )
-
+        st.metric("Indicator score", signal["confidence"])
         st.write(f'RSI: **{signal["rsi"]:.1f}**')
         st.write(f'EMA 20: **{signal["ema20"]:,.5f}**')
         st.write(f'EMA 50: **{signal["ema50"]:,.5f}**')
-
         st.caption(
-            "The signal combines trend, momentum and recent price "
-            "direction. It is a rule-based indicator, not a "
-            "guaranteed prediction."
+            "Rule-based indicators are not guaranteed predictions."
         )
 
     with right:
-        st.subheader("Current position")
+        st.subheader("Current Position")
 
-        if open_pos:
-            entry = float(open_pos["entry"])
-            stop = float(open_pos["stop_loss"])
-            target = float(open_pos["take_profit"])
-            qty = float(open_pos["qty"])
-
+        if open_position_row:
             st.write(
-                f"**{open_pos['side']}** · {qty:.6f} {symbol}  \n"
-                f"Entry: **{entry:,.5f}**  \n"
-                f"Stop: **{stop:,.5f}**  \n"
-                f"Target: **{target:,.5f}**"
+                f"**{open_position_row['side']}** · "
+                f"{float(open_position_row['qty']):.6f} {symbol}"
             )
-
+            st.write(
+                f"Entry: **{float(open_position_row['entry']):,.5f}**"
+            )
+            st.write(
+                f"Stop: **{float(open_position_row['stop_loss']):,.5f}**"
+            )
+            st.write(
+                f"Target: **{float(open_position_row['take_profit']):,.5f}**"
+            )
             st.metric("Position P/L", f"${unrealized:,.2f}")
-
         else:
             st.info("No open position for this market.")
 
 
 # ============================================================
-# TRADE PAGE
+# PAPER TRADING PAGE
 # ============================================================
 
 elif page == "Trade":
@@ -1007,26 +967,24 @@ elif page == "Trade":
     )
 
     st.caption(
-        "Orders are simulated. Risk is calculated from the "
-        "selected stop distance."
+        "Orders are simulated. Risk sizing uses the stop-loss distance."
     )
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Current price", fmt_price(last_price, symbol))
     c2.metric("Signal", signal["signal"])
-    c3.metric("Risk", f"{st.session_state.risk:.2f}%")
+    c3.metric("Risk per trade", f"{st.session_state.risk:.2f}%")
 
-    pos = get_position(username, symbol)
+    position = get_position(username, symbol)
 
-    if pos:
+    if position:
         st.warning(
-            f"You already have an open {pos['side']} "
-            f"position in {symbol}."
+            f"You already have an open {position['side']} position."
         )
 
-        entry = float(pos["entry"])
-        qty = float(pos["qty"])
-        side = pos["side"]
+        entry = float(position["entry"])
+        qty = float(position["qty"])
+        side = position["side"]
 
         pnl = (
             (last_price - entry) * qty
@@ -1037,94 +995,87 @@ elif page == "Trade":
         st.write(
             f"Entry **{fmt_price(entry, symbol)}** · "
             f"Current **{fmt_price(last_price, symbol)}** · "
-            f"Qty **{qty:.6f}**"
+            f"Quantity **{qty:.6f}**"
         )
 
         st.metric("Unrealized P/L", f"${pnl:,.2f}")
 
         if st.button(
-            "Close position",
+            "Close paper position",
             type="primary",
             use_container_width=True,
         ):
             ok, result = close_position(
-                username,
-                symbol,
-                last_price,
+                username, symbol, last_price
             )
 
             if ok:
                 st.success(
-                    f"Position closed. P/L: ${result:,.2f}"
+                    f"Paper position closed. P/L: ${result:,.2f}"
                 )
                 st.rerun()
             else:
                 st.error(result)
 
+    elif signal["atr"] <= 0:
+        st.error("Not enough data to calculate risk levels.")
+
     else:
-        if signal["atr"] <= 0:
-            st.error(
-                "Not enough market data to calculate risk levels."
-            )
+        side = st.radio(
+            "Direction",
+            ["BUY", "SELL"],
+            horizontal=True,
+        )
 
-        else:
-            side = st.radio(
-                "Direction",
-                ["BUY", "SELL"],
-                horizontal=True,
-            )
+        stop, target = position_levels(
+            last_price, signal["atr"], side
+        )
 
-            stop, target = position_levels(
-                last_price,
-                signal["atr"],
+        qty = calculate_qty(
+            balance,
+            last_price,
+            stop,
+            st.session_state.risk,
+        )
+
+        risk_money = balance * st.session_state.risk / 100
+        reward_money = abs(target - last_price) * qty
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Entry", fmt_price(last_price, symbol))
+        c2.metric("Stop loss", fmt_price(stop, symbol))
+        c3.metric("Take profit", fmt_price(target, symbol))
+        c4.metric("Risk/reward", "1 : 2")
+
+        st.write(
+            f"Suggested size: **{qty:.6f}** · "
+            f"Planned risk: **${risk_money:,.2f}** · "
+            f"Potential reward: **${reward_money:,.2f}**"
+        )
+
+        if st.button(
+            f"Open paper {side}",
+            type="primary",
+            use_container_width=True,
+        ):
+            ok, message = open_position(
+                username,
+                symbol,
                 side,
-            )
-
-            qty = calculate_qty(
-                balance,
                 last_price,
                 stop,
-                st.session_state.risk,
+                target,
+                qty,
             )
 
-            risk_money = balance * st.session_state.risk / 100
-            reward_money = abs(target - last_price) * qty
-
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Entry", fmt_price(last_price, symbol))
-            c2.metric("Stop loss", fmt_price(stop, symbol))
-            c3.metric("Take profit", fmt_price(target, symbol))
-            c4.metric("R:R", "1 : 2")
-
-            st.write(
-                f"Suggested size: **{qty:.6f}** · "
-                f"Max planned risk: **${risk_money:,.2f}** · "
-                f"Potential reward: **${reward_money:,.2f}**"
-            )
-
-            if st.button(
-                f"Open paper {side}",
-                type="primary",
-                use_container_width=True,
-            ):
-                ok, message = open_position(
-                    username,
-                    symbol,
-                    side,
-                    last_price,
-                    stop,
-                    target,
-                    qty,
-                )
-
-                if ok:
-                    st.success(message)
-                    st.rerun()
-                else:
-                    st.error(message)
+            if ok:
+                st.success(message)
+                st.rerun()
+            else:
+                st.error(message)
 
     st.divider()
-    st.subheader("Why this trade?")
+    st.subheader("Trade indicators")
 
     trend = (
         "bullish"
@@ -1134,16 +1085,16 @@ elif page == "Trade":
 
     st.write(
         f"Trend: **{trend}** · "
-        f'RSI: **{signal["rsi"]:.1f}** · '
-        f'Signal: **{signal["signal"]}**'
+        f"RSI: **{signal['rsi']:.1f}** · "
+        f"Signal: **{signal['signal']}**"
     )
 
 
 # ============================================================
-# HISTORY
+# TRADE HISTORY
 # ============================================================
 
-elif page == "History":
+else:
     st.markdown(
         '<div class="saim-title">Trade History</div>',
         unsafe_allow_html=True,
@@ -1159,20 +1110,17 @@ elif page == "History":
 
         total = (
             float(closed["pnl"].sum())
-            if not closed.empty
-            else 0.0
+            if not closed.empty else 0.0
         )
 
         wins = (
             int((closed["pnl"] > 0).sum())
-            if not closed.empty
-            else 0
+            if not closed.empty else 0
         )
 
         win_rate = (
             wins / len(closed) * 100
-            if len(closed)
-            else 0
+            if len(closed) else 0
         )
 
         c1, c2, c3, c4 = st.columns(4)
@@ -1181,48 +1129,48 @@ elif page == "History":
         c3.metric("Wins", wins)
         c4.metric("Win rate", f"{win_rate:.1f}%")
 
-        show = trades.copy()
+        display_trades = trades.copy()
 
-        for col, decimals in {
+        for column, decimals in {
             "pnl": 2,
             "entry": 5,
             "exit": 5,
         }.items():
-            if col in show.columns:
-                show[col] = pd.to_numeric(
-                    show[col],
+            if column in display_trades.columns:
+                display_trades[column] = pd.to_numeric(
+                    display_trades[column],
                     errors="coerce",
                 ).round(decimals)
 
         st.dataframe(
-            show,
+            display_trades,
             hide_index=True,
             use_container_width=True,
         )
 
         if not closed.empty:
             curve = closed.sort_values("id").copy()
-            curve["Equity change"] = curve["pnl"].cumsum()
+            curve["Cumulative P/L"] = curve["pnl"].cumsum()
 
-            fig = go.Figure()
+            figure = go.Figure()
 
-            fig.add_trace(
+            figure.add_trace(
                 go.Scatter(
                     x=curve["id"],
-                    y=curve["Equity change"],
+                    y=curve["Cumulative P/L"],
                     mode="lines+markers",
                     name="Cumulative P/L",
                 )
             )
 
-            fig.update_layout(
+            figure.update_layout(
                 template="plotly_dark",
                 height=350,
                 margin=dict(l=10, r=10, t=20, b=10),
             )
 
             st.plotly_chart(
-                fig,
+                figure,
                 use_container_width=True,
             )
 
@@ -1239,9 +1187,7 @@ elif page == "History":
 # ============================================================
 
 st.divider()
-
 st.caption(
-    "SAIM · Simple realistic paper trading · "
-    "East African FX included · No real broker orders are placed · "
-    "Market data can be delayed"
+    "SAIM · Paper trading only · No real broker orders are placed · "
+    "Market data may be delayed"
 )
